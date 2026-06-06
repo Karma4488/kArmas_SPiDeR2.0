@@ -17,9 +17,12 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
+import shutil
 import sys
 import time
+import threading
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
@@ -48,6 +51,177 @@ W  = "\033[97m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MATRIX RAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+MATRIX_CHARS = (
+    "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
+    "0123456789ABCDEF<>{}[]|/\\@#$%^&*~"
+    "アイウエオカキクケコサシスセソタチツテトナニヌネノ"
+)
+
+BANNER_LINES = [
+    r" ██╗  ██╗ █████╗ ██████╗ ███╗   ███╗ █████╗ ███████╗",
+    r" ██║ ██╔╝██╔══██╗██╔══██╗████╗ ████║██╔══██╗██╔════╝",
+    r" █████╔╝ ███████║██████╔╝██╔████╔██║███████║███████╗",
+    r" ██╔═██╗ ██╔══██║██╔══██╗██║╚██╔╝██║██╔══██║╚════██║",
+    r" ██║  ██╗██║  ██║██║  ██║██║ ╚═╝ ██║██║  ██║███████║",
+    r" ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝",
+    r" ███████╗██████╗ ██╗██████╗ ███████╗██████╗  ██████╗    ██████╗",
+    r" ██╔════╝██╔══██╗██║██╔══██╗██╔════╝██╔══██╗╚════██╗  ██╔═████╗",
+    r" ███████╗██████╔╝██║██║  ██║█████╗  ██████╔╝ █████╔╝  ██║██╔██║",
+    r" ╚════██║██╔═══╝ ██║██║  ██║██╔══╝  ██╔══██╗██╔═══╝   ████╔╝██║",
+    r" ███████║██║     ██║██████╔╝███████╗██║  ██║███████╗  ╚██████╔╝",
+    r" ╚══════╝╚═╝     ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝   ╚═════╝",
+    r"",
+    r"          ⟨ kArma's Spider 2.0 — The Strongest Crawler Ever ⟩",
+    r"",
+]
+
+def _ansi_move(row: int, col: int) -> str:
+    return f"\033[{row};{col}H"
+
+def _ansi_color_green_bright() -> str:  return "\033[1;92m"
+def _ansi_color_green_dim() -> str:     return "\033[2;32m"
+def _ansi_color_green_mid() -> str:     return "\033[0;32m"
+def _ansi_color_white() -> str:         return "\033[1;97m"
+def _ansi_color_red_bold() -> str:      return "\033[1;91m"
+def _ansi_color_yellow_bold() -> str:   return "\033[1;93m"
+def _ansi_color_magenta_bold() -> str:  return "\033[1;95m"
+def _ansi_color_reset() -> str:         return "\033[0m"
+def _ansi_hide_cursor() -> str:         return "\033[?25l"
+def _ansi_show_cursor() -> str:         return "\033[?25h"
+def _ansi_clear_screen() -> str:        return "\033[2J"
+def _ansi_alt_screen_on() -> str:       return "\033[?1049h"
+def _ansi_alt_screen_off() -> str:      return "\033[?1049l"
+
+
+def matrix_rain_intro(duration: float = 4.5, banner_reveal_at: float = 2.2):
+    """
+    Full-terminal matrix rain intro. Falls for `duration` seconds,
+    then fades into the kArmas SPiDeR banner burned into the centre.
+    """
+    cols, rows = shutil.get_terminal_size(fallback=(100, 30))
+
+    # ── state per column ─────────────────────────────────────────────────────
+    class Drop:
+        __slots__ = ("head", "length", "speed", "chars", "active")
+        def __init__(self):
+            self.head   = random.randint(-rows, 0)
+            self.length = random.randint(6, rows // 2)
+            self.speed  = random.choice([1, 1, 1, 2])
+            self.chars  = [random.choice(MATRIX_CHARS) for _ in range(rows + 5)]
+            self.active = True
+
+        def step(self):
+            self.head += self.speed
+            # randomly mutate one char in the trail
+            idx = random.randint(0, len(self.chars) - 1)
+            self.chars[idx] = random.choice(MATRIX_CHARS)
+
+    drops = [Drop() for _ in range(cols)]
+
+    # ── banner geometry ───────────────────────────────────────────────────────
+    banner_height = len(BANNER_LINES)
+    banner_top    = max(1, (rows - banner_height) // 2)
+    banner_width  = max((len(l) for l in BANNER_LINES), default=0)
+    banner_left   = max(1, (cols - banner_width) // 2)
+
+    out = sys.stdout
+    out.write(_ansi_alt_screen_on())
+    out.write(_ansi_hide_cursor())
+    out.write(_ansi_clear_screen())
+    out.flush()
+
+    t_start   = time.perf_counter()
+    revealed  = False
+    frame_dt  = 0.045   # ~22 fps
+
+    try:
+        while True:
+            now     = time.perf_counter()
+            elapsed = now - t_start
+            if elapsed >= duration:
+                break
+
+            buf = []
+
+            # ── draw rain ────────────────────────────────────────────────────
+            for col_idx, drop in enumerate(drops):
+                drop.step()
+                x = col_idx + 1   # 1-indexed terminal col
+
+                for trail_pos in range(drop.length):
+                    row_pos = drop.head - trail_pos
+                    if row_pos < 1 or row_pos > rows:
+                        continue
+
+                    ch = drop.chars[row_pos % len(drop.chars)]
+
+                    if trail_pos == 0:
+                        color = _ansi_color_white()        # bright head
+                    elif trail_pos < 3:
+                        color = _ansi_color_green_bright()
+                    elif trail_pos < drop.length // 2:
+                        color = _ansi_color_green_mid()
+                    else:
+                        color = _ansi_color_green_dim()
+
+                    buf.append(f"{_ansi_move(row_pos, x)}{color}{ch}")
+
+                # erase tail cell
+                tail = drop.head - drop.length
+                if 1 <= tail <= rows:
+                    buf.append(f"{_ansi_move(tail, x)} ")
+
+                # recycle drop when it scrolls off
+                if drop.head - drop.length > rows:
+                    drops[col_idx] = Drop()
+                    drops[col_idx].head = 0
+
+            # ── reveal banner after threshold ─────────────────────────────────
+            if elapsed >= banner_reveal_at and not revealed:
+                revealed = True
+
+            if revealed:
+                fade = min(1.0, (elapsed - banner_reveal_at) / 1.5)
+                for li, line in enumerate(BANNER_LINES):
+                    r = banner_top + li
+                    if r < 1 or r > rows:
+                        continue
+                    # choose colour by section
+                    if li < 6:
+                        col_code = _ansi_color_red_bold()
+                    elif li < 12:
+                        col_code = _ansi_color_magenta_bold()
+                    elif "kArma" in line:
+                        col_code = _ansi_color_yellow_bold()
+                    else:
+                        col_code = _ansi_color_green_mid()
+
+                    # partial reveal: show chars left-to-right as fade increases
+                    visible = int(len(line) * fade)
+                    visible_line = line[:visible]
+
+                    buf.append(
+                        f"{_ansi_move(r, banner_left)}{col_code}{visible_line}"
+                        f"{_ansi_color_reset()}"
+                    )
+
+            out.write("".join(buf) + _ansi_color_reset())
+            out.flush()
+            time.sleep(frame_dt)
+
+        # ── hold final frame 0.4 s then fade out ─────────────────────────────
+        time.sleep(0.4)
+
+    finally:
+        out.write(_ansi_show_cursor())
+        out.write(_ansi_alt_screen_off())
+        out.write(_ansi_color_reset())
+        out.flush()
 
 BANNER = f"""
 {R}{BOLD}
@@ -581,6 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Directory to save results (JSON, CSV, XML, emails, links)")
     out.add_argument("--verbose", "-v", action="store_true",
                      help="Enable verbose/debug logging")
+    out.add_argument("--no-intro", action="store_true",
+                     help="Skip the matrix rain intro animation")
 
     return p
 
@@ -602,6 +778,13 @@ def main():
         print(f"{R}[!] Only http/https URLs supported.{RESET}")
         sys.exit(1)
 
+    # ── matrix rain intro ────────────────────────────────────────────────────
+    if sys.stdout.isatty() and not cfg.no_intro:
+        try:
+            matrix_rain_intro(duration=4.8, banner_reveal_at=2.0)
+        except Exception:
+            pass   # never let the intro crash the actual crawl
+
     spider = KArmasSpider(cfg)
     try:
         asyncio.run(spider.run())
@@ -613,3 +796,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
